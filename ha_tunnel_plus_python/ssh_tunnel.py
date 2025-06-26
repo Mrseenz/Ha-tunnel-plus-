@@ -288,8 +288,24 @@ import socket
 import threading
 import select
 import struct
-import logging # Added
-import paramiko # Already used, but good to ensure it's seen for context
+import logging
+import paramiko
+import socket # Already present
+import threading # Already present
+import select # Already present
+import struct # Already present
+
+try:
+    from scapy.layers.tls.handshake import TLSClientHello, TLSServerHello
+    from scapy.layers.tls.extensions import TLSExtension, TLSExtServerNameIndication, ServerName, ServerNameIndicationHostName
+    from scapy.layers.tls.record import TLS
+    SCAPY_AVAILABLE = True
+except ImportError:
+    SCAPY_AVAILABLE = False
+    # This will be logged by the logger passed in or the default one if used directly
+    # print("WARNING: Scapy is not installed or TLS layers are missing. SNI customization will not be available.")
+    # print("Install scapy with TLS support (e.g., pip install scapy[tls] or pip install scapy cryptography)")
+
 
 # Default logger if none is provided by the main application
 default_logger = logging.getLogger(__name__)
@@ -303,7 +319,7 @@ class SSHTunnel:
     that tunnels traffic through the SSH connection.
     """
     def __init__(self, ssh_server, ssh_port, ssh_username,
-                 ssh_password=None, ssh_key_filepath=None, logger=None):
+                 ssh_password=None, ssh_key_filepath=None, logger=None, custom_sni=None):
         """
         Initializes the SSHTunnel configuration.
 
@@ -316,6 +332,8 @@ class SSHTunnel:
                                              Defaults to None.
             logger (logging.Logger, optional): An external logger instance.
                                                If None, a default module logger is used.
+            custom_sni (str, optional): A custom SNI value to inject into TLS handshakes.
+                                        Defaults to None (no SNI modification).
         """
         self.ssh_server = ssh_server
         self.ssh_port = ssh_port
@@ -325,6 +343,11 @@ class SSHTunnel:
         self.client = None
         self.running = False  # For SOCKS proxy state
         self.logger = logger if logger else default_logger
+        self.custom_sni = custom_sni
+
+        if self.custom_sni and not SCAPY_AVAILABLE:
+            self.logger.warning("Custom SNI specified, but Scapy is not available. SNI customization will be disabled.")
+            self.custom_sni = None # Disable if scapy is missing
 
     def is_ssh_connected(self):
         """Checks if the SSH client is connected and the transport is active."""
@@ -629,6 +652,54 @@ class SSHTunnel:
                     client_socket.sendall(reply)
                     self.logger.debug(f"SOCKS: Sent CONNECT success reply to {client_address}")
 
+                    # SNI Modification Point
+                    if self.custom_sni and SCAPY_AVAILABLE:
+                        self.logger.debug(f"SOCKS: SNI modification active for {client_address}. Custom SNI: {self.custom_sni}")
+                        # Try to peek at the first packet for TLS ClientHello
+                        # client_socket must be non-blocking for peeking, or use select
+                        client_socket.setblocking(False)
+                        initial_data = b""
+                        try:
+                            # Wait for data for a very short time (e.g., up to 0.1 seconds)
+                            # This is a simple way to peek; a more robust way might involve select with timeout
+                            ready_to_read, _, _ = select.select([client_socket], [], [], 0.1)
+                            if ready_to_read:
+                                initial_data = client_socket.recv(4096, socket.MSG_PEEK) # Peek at data
+
+                            if initial_data:
+                                self.logger.debug(f"SOCKS: Peeked {len(initial_data)} bytes for SNI processing from {client_address}")
+                                # Basic check for TLS ClientHello (Content Type 22, Handshake Type 1)
+                                if initial_data[0] == 0x16 and initial_data[5] == 0x01: # TLS Handshake, ClientHello
+                                    self.logger.debug(f"SOCKS: Detected potential TLS ClientHello from {client_address}")
+                                    actual_client_hello_data = client_socket.recv(len(initial_data)) # Consume the peeked data
+
+                                    modified_hello = self._modify_sni_in_clienthello(actual_client_hello_data, self.custom_sni, client_address)
+                                    if modified_hello:
+                                        self.logger.info(f"SOCKS: SNI modified for {client_address}. Sending modified ClientHello to SSH channel.")
+                                        ssh_channel.sendall(modified_hello)
+                                    else:
+                                        self.logger.debug(f"SOCKS: SNI not modified (or failed), sending original ClientHello from {client_address} to SSH channel.")
+                                        ssh_channel.sendall(actual_client_hello_data)
+                                else:
+                                    self.logger.debug(f"SOCKS: Initial data from {client_address} does not appear to be TLS ClientHello. Forwarding as is.")
+                                    # No need to consume here as it wasn't a ClientHello we are modifying
+                            else:
+                            self.logger.debug(f"SOCKS: No initial data peeked from {client_address_info} for SNI mod within timeout. Proceeding to relay.")
+                        except BlockingIOError:
+                            # This is expected if client doesn't send data immediately
+                            self.logger.debug(f"SOCKS: No initial data immediately available from {client_address} for SNI (BlockingIOError). Proceeding to relay.")
+                        except socket.timeout:
+                            self.logger.debug(f"SOCKS: Socket timeout while peeking/receiving initial data for SNI from {client_address_info}. Proceeding to relay.")
+                        except socket.error as sock_err:
+                            self.logger.error(f"SOCKS: Socket error during SNI initial data recv for {client_address_info}: {sock_err}. Proceeding to relay.")
+                        except Exception as sni_e:
+                            self.logger.exception(f"SOCKS: Unexpected error during SNI processing for {client_address_info}: {sni_e}. Forwarding any consumed data if possible.")
+                            # If actual_client_hello_data was populated and an error happened after,
+                            # it's already sent in the _modify_sni_in_clienthello fallback.
+                            # If error was before/during recv, nothing to send here.
+                        finally:
+                             client_socket.setblocking(True) # Restore blocking mode for relay
+
                     self._relay_data(client_socket, ssh_channel, client_address)
 
                 except paramiko.ChannelException as e: # Specific exception for channel open failures
@@ -736,7 +807,80 @@ class SSHTunnel:
             # client_socket is closed by _handle_socks_client's finally block
             pass
 
-    def _relay_data(self, client_socket, ssh_channel, client_address_info): # Added client_address_info for logging
+    def _modify_sni_in_clienthello(self, client_hello_bytes, custom_sni_value, client_address_info):
+        """
+        Parses a TLS ClientHello byte string, modifies its SNI extension, and returns the modified bytes.
+        Uses Scapy for parsing and building.
+
+        Args:
+            client_hello_bytes (bytes): The original ClientHello packet bytes.
+            custom_sni_value (str): The custom SNI hostname to set.
+            client_address_info (tuple): Client's address for logging.
+
+        Returns:
+            bytes: The modified ClientHello packet bytes, or the original bytes if modification fails
+                   or SNI is not present. Returns None on critical parsing failure.
+        """
+        if not SCAPY_AVAILABLE or not self.custom_sni: # Should be checked before calling, but as a safeguard
+            self.logger.debug(f"SOCKS: _modify_sni_called for {client_address_info} but Scapy unavailable or no custom_sni.")
+            return client_hello_bytes
+
+        try:
+            tls_record = TLS(client_hello_bytes)
+
+            if not tls_record.haslayer(TLSClientHello):
+                self.logger.warning(f"SOCKS: Scapy parsed record from {client_address_info} as TLS, but no ClientHello layer found. Original len: {len(client_hello_bytes)}. Forwarding as is.")
+                if self.logger.isEnabledFor(logging.DEBUG):
+                    self.logger.debug(f"Record summary for {client_address_info}: {tls_record.summary()}")
+                    if tls_record.msg and len(tls_record.msg) > 0:
+                       self.logger.debug(f"Actual handshake type for {client_address_info}: {type(tls_record.msg[0])}")
+                return client_hello_bytes
+
+            client_hello_pkt = tls_record[TLSClientHello]
+            modified = False
+
+            if client_hello_pkt.extensions:
+                for i, ext in enumerate(client_hello_pkt.extensions):
+                    if ext.type == 0: # server_name (SNI)
+                        original_sni_value = "NotDecoded"
+                        try:
+                            # Attempt to decode existing SNI for logging, handle potential errors
+                            if ext.servernames and ext.servernames[0].data:
+                                original_sni_value = ext.servernames[0].data.decode('utf-8', 'ignore')
+                        except Exception:
+                            pass # Ignore if decoding fails, will just log "NotDecoded"
+
+                        self.logger.info(f"SOCKS: Found SNI '{original_sni_value}' for {client_address_info}. Modifying to '{custom_sni_value}'.")
+
+                        # Create new ServerNameIndication data
+                        sni_field_data = ServerNameIndicationHostName(servername=custom_sni_value.encode('utf-8'))
+                        # Replace the entire SNI extension object
+                        client_hello_pkt.extensions[i] = TLSExtServerNameIndication(servernames=[sni_field_data])
+
+                        modified = True
+                        break
+                if not modified:
+                     self.logger.debug(f"SOCKS: SNI extension field (type 0) not found in ClientHello from {client_address_info}, though other extensions might exist. SNI not modified.")
+            else:
+                self.logger.debug(f"SOCKS: No extensions field found in ClientHello from {client_address_info}. Cannot modify SNI.")
+
+            if modified:
+                self.logger.debug(f"SOCKS: Rebuilding TLS record for {client_address_info} after SNI modification.")
+                modified_bytes = bytes(tls_record)
+                self.logger.info(f"SOCKS: SNI modification successful for {client_address_info}. Original len: {len(client_hello_bytes)}, New len: {len(modified_bytes)}")
+                return modified_bytes
+            else:
+                self.logger.debug(f"SOCKS: No SNI modification performed for {client_address_info}. Forwarding original ClientHello.")
+                return client_hello_bytes
+
+        except Exception as e:
+            # Catching a broad exception here because Scapy can raise various things on malformed packets.
+            self.logger.error(f"SOCKS: Scapy parsing/building error during SNI modification for {client_address_info}: {e}")
+            if self.logger.isEnabledFor(logging.DEBUG):
+                 self.logger.debug(f"Problematic ClientHello bytes for {client_address_info} (hex): {client_hello_bytes.hex() if client_hello_bytes else 'None'}")
+            return client_hello_bytes # Return original on error
+
+    def _relay_data(self, client_socket, ssh_channel, client_address_info):
         """
         Relays data between a SOCKS client and an SSH channel.
 

@@ -21,8 +21,9 @@ This project is a Python-based proof-of-concept inspired by HA Tunnel Plus, aimi
 *   Runs a local SOCKS5 proxy server.
 *   Forwards TCP traffic from applications configured to use the local SOCKS proxy through the SSH tunnel.
 *   Basic command-line interface for configuration.
+*   **SNI (Server Name Indication) Customization:** Allows spoofing the SNI in TLS handshakes.
 *   Logging for operational messages and errors.
-*   Basic unit tests for core SSH functionality.
+*   Basic unit tests for core SSH functionality and SNI modification logic.
 
 **Functionality Breakdown:**
 
@@ -40,15 +41,29 @@ This project is a Python-based proof-of-concept inspired by HA Tunnel Plus, aimi
         *   Authentication method (password, key file).
         *   Local SOCKS proxy host and port.
         *   Verbose logging option.
+    *   Custom SNI value for spoofing.
+4.  **SNI Customization (`ssh_tunnel.py`):**
+    *   If a custom SNI value is provided and `scapy` is installed:
+        *   The SOCKS proxy attempts to peek at the initial data of outgoing TCP connections.
+        *   If the data appears to be a TLS ClientHello message, it's parsed using Scapy.
+        *   The SNI field in the ClientHello is replaced with the custom SNI value.
+        *   The modified ClientHello is then sent through the SSH tunnel.
+        *   If Scapy is not available or parsing/modification fails, the original data is forwarded.
 
 **Installation:**
 
 1.  **Clone the repository (if applicable) or download the source files.**
 2.  **Install dependencies:**
-    The primary dependency is `paramiko`.
-    ```bash
-    pip install paramiko
-    ```
+    *   **Core:** `paramiko` is required for SSH functionality.
+        ```bash
+        pip install paramiko
+        ```
+    *   **For SNI Customization:** `scapy` is required. If you intend to use the SNI spoofing feature, install Scapy (which might also need `cryptography` or other dependencies depending on your system for full TLS support).
+        ```bash
+        pip install scapy
+        # or potentially: pip install scapy[tls]
+        ```
+        If Scapy is not installed, SNI customization will be disabled (a warning will be logged if you try to use the feature).
 
 **Usage:**
 
@@ -72,6 +87,7 @@ Run the `main.py` script from the `ha_tunnel_plus_python` directory with the req
 **Other Optional Arguments:**
 
 *   `--port SSH_PORT`: The SSH server port (default: `22`).
+*   `--spoof-sni SPOOFED_HOSTNAME`: The hostname to use as the SNI value for all outgoing TLS connections. Requires Scapy to be installed.
 *   `-v`, `--verbose`: Enable verbose debug logging.
 
 **Example Usage:**
@@ -90,6 +106,12 @@ Run the `main.py` script from the `ha_tunnel_plus_python` directory with the req
     ```bash
     python ha_tunnel_plus_python/main.py --server your.ssh.server.com --user myuser --socks-port 11080 -v
     ```
+4.  **Using SNI Spoofing:**
+    ```bash
+    # Make sure scapy is installed: pip install scapy
+    python ha_tunnel_plus_python/main.py --server your.ssh.server.com --user myuser --key ~/.ssh/id_rsa --spoof-sni fake.domain.com
+    ```
+    When connecting to an HTTPS site via the proxy, the TLS SNI will be set to `fake.domain.com`.
 
 After running, configure your application (e.g., web browser, FTP client) to use the SOCKS5 proxy at the specified local host and port (e.g., `127.0.0.1:1080`).
 
@@ -108,9 +130,9 @@ python -m unittest ha_tunnel_plus_python.tests.test_ssh_tunnel
 **Current Limitations & Future Scope:**
 
 *   **SOCKS5 Features:** Only supports the `CONNECT` command for TCP. `BIND` and `UDP ASSOCIATE` are not implemented. Authentication for the SOCKS proxy itself (client to SOCKS proxy) is not implemented (defaults to "NO AUTHENTICATION REQUIRED").
-*   **SNI Customization:** Investigated but not yet implemented. This would allow specifying a custom Server Name Indication for TLS handshakes.
+*   **SNI Customization:** Implemented for outgoing TLS connections via the SOCKS proxy. Requires `scapy`. Currently supports a global SNI override. Does not add an SNI extension if one is not already present in the original ClientHello.
 *   **Other Protocols (UDP, ICMP, IGMP):** The current SOCKS-based approach primarily targets TCP. Tunneling UDP effectively over SSH is complex, and ICMP/IGMP would likely require a TUN/TAP based architecture, which is a significant departure.
-*   **Error Handling:** While improved, it can be made more robust, especially for diverse network conditions and SOCKS client behaviors.
+*   **Error Handling:** While improved, it can be made more robust, especially for diverse network conditions, SOCKS client behaviors, and Scapy parsing edge cases.
 *   **GUI:** No graphical user interface is provided.
 *   **Configuration Files:** Does not currently support loading configurations from a file.
 *   **Packaging:** Not set up as an installable Python package.

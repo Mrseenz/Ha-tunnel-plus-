@@ -279,6 +279,119 @@ class TestSSHTunnel(unittest.TestCase):
         mock_relay_data.assert_called_with(mock_client_socket, mock_ssh_channel, client_address)
         mock_client_socket.close.assert_called_once()
 
+    # --- SNI Modification Tests ---
+
+    def _build_dummy_client_hello(self, sni_hostname=None):
+        """Helper to build a very basic TLSClientHello with optional SNI for testing."""
+        # Ensure ssh_tunnel is imported for Scapy components
+        from ha_tunnel_plus_python import ssh_tunnel as current_ssh_tunnel_module
+
+        if not current_ssh_tunnel_module.SCAPY_AVAILABLE:
+            self.skipTest("Scapy is not available, skipping SNI modification tests.")
+
+        extensions = []
+        if sni_hostname:
+            sni_ext_data = current_ssh_tunnel_module.ServerNameIndicationHostName(servername=sni_hostname.encode('utf-8'))
+            sni_extension = current_ssh_tunnel_module.TLSExtServerNameIndication(servernames=[sni_ext_data])
+            extensions.append(sni_extension)
+
+        client_hello = current_ssh_tunnel_module.TLSClientHello(
+            version=0x0303, # TLS 1.2
+            sid=b'\x01\x02\x03\x04',
+            cipher_suites=[0xc02b, 0xc02f],
+            extensions=extensions if extensions else None
+        )
+        tls_record = current_ssh_tunnel_module.TLS(type=22, version=0x0301, msg=[client_hello])
+        return bytes(tls_record)
+
+    def test_modify_sni_present_and_custom_sni_set(self):
+        from ha_tunnel_plus_python import ssh_tunnel as current_ssh_tunnel_module
+        if not current_ssh_tunnel_module.SCAPY_AVAILABLE: self.skipTest("Scapy unavailable")
+
+        original_sni = "original.example.com"
+        custom_sni = "custom.example.net"
+        client_hello_bytes = self._build_dummy_client_hello(sni_hostname=original_sni)
+
+        tunnel = SSHTunnel(self.ssh_server, self.ssh_port, self.ssh_user, logger=self.logger, custom_sni=custom_sni)
+
+        modified_bytes = tunnel._modify_sni_in_clienthello(client_hello_bytes, custom_sni, ('127.0.0.1', 123))
+        self.assertIsNotNone(modified_bytes)
+        self.assertNotEqual(client_hello_bytes, modified_bytes, "ClientHello should have been modified.")
+
+        modified_tls_record = current_ssh_tunnel_module.TLS(modified_bytes)
+        self.assertTrue(modified_tls_record.haslayer(current_ssh_tunnel_module.TLSClientHello))
+        modified_ch = modified_tls_record[current_ssh_tunnel_module.TLSClientHello]
+        found_sni_in_modified = False
+        for ext in modified_ch.extensions:
+            if isinstance(ext, current_ssh_tunnel_module.TLSExtServerNameIndication):
+                self.assertEqual(len(ext.servernames), 1)
+                self.assertEqual(ext.servernames[0].servername.decode('utf-8'), custom_sni)
+                found_sni_in_modified = True
+                break
+        self.assertTrue(found_sni_in_modified, "Custom SNI not found in modified ClientHello")
+
+    def test_modify_sni_not_present_custom_sni_set(self):
+        from ha_tunnel_plus_python import ssh_tunnel as current_ssh_tunnel_module
+        if not current_ssh_tunnel_module.SCAPY_AVAILABLE: self.skipTest("Scapy unavailable")
+
+        custom_sni = "custom.example.net"
+        client_hello_bytes = self._build_dummy_client_hello(sni_hostname=None)
+
+        tunnel = SSHTunnel(self.ssh_server, self.ssh_port, self.ssh_user, logger=self.logger, custom_sni=custom_sni)
+
+        modified_bytes = tunnel._modify_sni_in_clienthello(client_hello_bytes, custom_sni, ('127.0.0.1', 123))
+        self.assertEqual(client_hello_bytes, modified_bytes, "ClientHello should not be modified if SNI was not originally present.")
+
+    def test_modify_sni_present_but_no_custom_sni_set(self):
+        from ha_tunnel_plus_python import ssh_tunnel as current_ssh_tunnel_module
+        if not current_ssh_tunnel_module.SCAPY_AVAILABLE: self.skipTest("Scapy unavailable")
+
+        original_sni = "original.example.com"
+        client_hello_bytes = self._build_dummy_client_hello(sni_hostname=original_sni)
+
+        tunnel = SSHTunnel(self.ssh_server, self.ssh_port, self.ssh_user, logger=self.logger, custom_sni=None)
+
+        modified_bytes = tunnel._modify_sni_in_clienthello(client_hello_bytes, None, ('127.0.0.1', 123))
+        self.assertEqual(client_hello_bytes, modified_bytes, "ClientHello should not be modified if custom_sni is None.")
+
+        original_tls_record = current_ssh_tunnel_module.TLS(modified_bytes)
+        self.assertTrue(original_tls_record.haslayer(current_ssh_tunnel_module.TLSClientHello))
+        original_ch = original_tls_record[current_ssh_tunnel_module.TLSClientHello]
+        found_sni_in_original = False
+        for ext in original_ch.extensions:
+            if isinstance(ext, current_ssh_tunnel_module.TLSExtServerNameIndication):
+                self.assertEqual(ext.servernames[0].servername.decode('utf-8'), original_sni)
+                found_sni_in_original = True
+                break
+        self.assertTrue(found_sni_in_original)
+
+
+    def test_modify_sni_scapy_unavailable(self):
+        # This test needs to mock SCAPY_AVAILABLE at the module level where SSHTunnel reads it.
+        client_hello_bytes = b'\x16\x03\x01\x00\x00\x01...'
+        custom_sni = "custom.example.net"
+
+        with patch('ha_tunnel_plus_python.ssh_tunnel.SCAPY_AVAILABLE', False):
+            # Re-initialize tunnel within this context so it sees the mocked SCAPY_AVAILABLE
+            tunnel = SSHTunnel(self.ssh_server, self.ssh_port, self.ssh_user, logger=self.logger, custom_sni=custom_sni)
+            self.assertIsNone(tunnel.custom_sni, "custom_sni should be disabled if Scapy is unavailable at init")
+
+            # Call the method directly - it also checks SCAPY_AVAILABLE internally
+            modified_bytes = tunnel._modify_sni_in_clienthello(client_hello_bytes, custom_sni, ('127.0.0.1', 123))
+            self.assertEqual(client_hello_bytes, modified_bytes, "ClientHello should not be modified if Scapy is unavailable.")
+
+    def test_malformed_client_hello_for_sni_modification(self):
+        from ha_tunnel_plus_python import ssh_tunnel as current_ssh_tunnel_module
+        if not current_ssh_tunnel_module.SCAPY_AVAILABLE: self.skipTest("Scapy unavailable")
+
+        custom_sni = "custom.example.net"
+        malformed_bytes = b"\x16\x03\x01\x00\x05\x01\x00\x00\x01"
+
+        tunnel = SSHTunnel(self.ssh_server, self.ssh_port, self.ssh_user, logger=self.logger, custom_sni=custom_sni)
+
+        modified_bytes = tunnel._modify_sni_in_clienthello(malformed_bytes, custom_sni, ('127.0.0.1', 123))
+        self.assertEqual(malformed_bytes, modified_bytes)
+
 
 if __name__ == '__main__':
     unittest.main()

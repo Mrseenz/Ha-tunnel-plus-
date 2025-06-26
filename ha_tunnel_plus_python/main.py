@@ -29,12 +29,15 @@ def main():
     parser.add_argument("--socks-host", default="127.0.0.1", help="Local host for SOCKS proxy (default: 127.0.0.1).")
     parser.add_argument("--socks-port", type=int, default=1080, help="Local port for SOCKS proxy (default: 1080).")
 
-    # Placeholder for future SNI feature
-    # parser.add_argument("--custom-sni", help="Custom SNI hostname to use for TLS connections.")
+    parser.add_argument("--spoof-sni", help="Hostname to use as the SNI value for all TLS connections (if SNI modification is possible).")
 
     parser.add_argument("-v", "--verbose", action="store_true", help="Enable verbose logging (currently basic).")
 
     args = parser.parse_args()
+
+    if args.spoof_sni and not SCAPY_AVAILABLE:
+        logger.warning("Scapy is not available, --spoof-sni functionality will be disabled.")
+        # No need to nullify args.spoof_sni here, SSHTunnel init will handle it.
 
     # Handle verbosity
     if args.verbose:
@@ -58,16 +61,25 @@ def main():
 
 
     # --- Initialize and Connect ---
-    # Pass the logger instance to the tunnel
+    # Pass the logger instance and custom_sni to the tunnel
+    tunnel_params = {
+        "ssh_server": args.server,
+        "ssh_port": args.port,
+        "ssh_username": args.user,
+        "logger": logger,
+        "custom_sni": args.spoof_sni # Pass the custom SNI value
+    }
     if args.key:
         logger.info(f"Attempting SSH connection to {args.user}@{args.server}:{args.port} using key {args.key}...")
-        tunnel = SSHTunnel(args.server, args.port, args.user, ssh_key_filepath=args.key, logger=logger)
+        tunnel_params["ssh_key_filepath"] = args.key
     elif ssh_password:
         logger.info(f"Attempting SSH connection to {args.user}@{args.server}:{args.port} using password...")
-        tunnel = SSHTunnel(args.server, args.port, args.user, ssh_password=ssh_password, logger=logger)
+        tunnel_params["ssh_password"] = ssh_password
     else:
         logger.info(f"Attempting SSH connection to {args.user}@{args.server}:{args.port} (e.g., using SSH Agent or no auth)...")
-        tunnel = SSHTunnel(args.server, args.port, args.user, logger=logger)
+        # No specific auth param needed if relying on agent or no auth
+
+    tunnel = SSHTunnel(**tunnel_params)
 
     if not tunnel.connect():
         # Specific error messages are now logged within tunnel.connect()
